@@ -3747,6 +3747,10 @@
    * For same-item same-buyer scenarios, includes timestamp rounded to minute to allow multiple sales
    */
   function createTransactionSignature(sale, element = null) {
+    // Extract stream_id from current URL to prevent cross-stream duplicates
+    // This ensures "iPad" sold in Stream A is not marked as duplicate of "iPad" sold in Stream B
+    const streamId = extractStreamIdFromUrl(window.location.href) || 'unknown';
+    
     const price = sale.sold_price || 0;
     const itemName = (sale.item_name || '').trim().toLowerCase();
     const buyer = (sale.buyer_username || '').trim().toLowerCase();
@@ -3779,11 +3783,12 @@
       uniqueId = `t${minuteTimestamp}${elementPos}`;
     }
     
-    // Create signature with unique identifier to handle same-item same-buyer scenarios
-    const signature = `${streamer}|${itemName}|${buyer}|${price}|${uniqueId}`;
+    // Create signature with stream_id prefix to prevent cross-stream duplicates
+    // Format: stream_id|streamer|itemName|buyer|price|uniqueId
+    const signature = `${streamId}|${streamer}|${itemName}|${buyer}|${price}|${uniqueId}`;
     
     // #region agent log
-    fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2831',message:'Creating transaction signature',data:{signature,streamer,itemName:itemName.substring(0,50),buyer,price,uniqueId,isDuplicate:processedTransactions.has(signature)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'DUPLICATE'})}).catch(()=>{});
+    fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'content.js:2831',message:'Creating transaction signature',data:{signature,streamId,streamer,itemName:itemName.substring(0,50),buyer,price,uniqueId,isDuplicate:processedTransactions.has(signature)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'DUPLICATE'})}).catch(()=>{});
     // #endregion
     
     return signature;

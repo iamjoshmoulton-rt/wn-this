@@ -37,50 +37,112 @@ let connectionStatus = {
   error: null
 };
 
-// Current live stream state
-let currentStream = {
-  streamer_username: null,
-  title: null,
-  stream_url: null,
-  stream_id: null, // NEW: Stream UUID from URL
-  lastViewerCount: null,
-  lastPendingItems: null,
-  updateInterval: null,
-  stream_start_time: null
-};
+// Multi-stream state management - Map keyed by livestream_id (UUID)
+const streamsMap = new Map(); // Key: stream_id (UUID), Value: stream state object
+const updateIntervalsMap = new Map(); // Key: stream_id, Value: intervalId for viewer count updates
 
 /**
- * Reset stream session - clears all stream-specific state
- * Called when URL changes, streamer changes, or tab navigates away
+ * Get or create stream state for a given stream ID
+ * @param {string} streamId - Livestream UUID
+ * @returns {Object} Stream state object
  */
-function resetStreamSession() {
-  console.log('[Whatnot Pulse] Resetting stream session - clearing all stream state');
-  
-  // Stop any active viewer count updates
-  if (currentStream.updateInterval) {
-    clearInterval(currentStream.updateInterval);
-    currentStream.updateInterval = null;
+function getOrCreateStream(streamId) {
+  if (!streamId) {
+    console.warn('[Whatnot Pulse] getOrCreateStream called without streamId');
+    return null;
   }
   
-  // Clear all stream-specific state
-  currentStream.stream_start_time = null;
-  currentStream.lastViewerCount = null;
-  currentStream.lastPendingItems = null;
-  currentStream.streamer_username = null;
-  currentStream.title = null;
-  currentStream.stream_url = null;
-  currentStream.stream_id = null;
-  
-  // Clear stored stream info
-  chrome.storage.local.remove([
-    'current_streamer_username',
-    'current_stream_title',
-    'current_stream_url'
-  ]).catch(err => {
-    console.warn('[Whatnot Pulse] Error clearing stored stream info:', err);
-  });
-  
-  console.log('[Whatnot Pulse] Stream session reset complete');
+  if (!streamsMap.has(streamId)) {
+    streamsMap.set(streamId, {
+      streamer_username: null,
+      title: null,
+      stream_url: null,
+      stream_id: streamId,
+      lastViewerCount: null,
+      lastPendingItems: null,
+      stream_start_time: null
+    });
+    console.log('[Whatnot Pulse] Created new stream state for:', streamId);
+  }
+  return streamsMap.get(streamId);
+}
+
+/**
+ * Get stream state by tab ID
+ * @param {number} tabId - Chrome tab ID
+ * @returns {Promise<Object|null>} Stream state or null if not found
+ */
+async function getStreamByTabId(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab || !tab.url) return null;
+    
+    const streamId = extractStreamIdFromUrl(tab.url);
+    if (!streamId) return null;
+    
+    return streamsMap.get(streamId) || null;
+  } catch (error) {
+    console.warn('[Whatnot Pulse] Error getting stream by tab ID:', error);
+    return null;
+  }
+}
+
+/**
+ * Reset stream session - clears stream-specific state
+ * If streamId is provided, only clears that specific stream. Otherwise clears all streams.
+ * Called when URL changes, streamer changes, or tab navigates away
+ * @param {string|null} streamId - Optional stream ID to reset. If null, resets all streams.
+ */
+function resetStreamSession(streamId = null) {
+  if (streamId) {
+    // Reset only this specific stream
+    console.log('[Whatnot Pulse] Resetting stream session for stream:', streamId);
+    
+    // Stop any active viewer count updates for this stream
+    const intervalId = updateIntervalsMap.get(streamId);
+    if (intervalId) {
+      clearInterval(intervalId);
+      updateIntervalsMap.delete(streamId);
+      console.log('[Whatnot Pulse] Stopped viewer count updates for stream:', streamId);
+    }
+    
+    // Remove stream from map
+    const streamState = streamsMap.get(streamId);
+    if (streamState) {
+      streamsMap.delete(streamId);
+      console.log('[Whatnot Pulse] Removed stream state for:', streamId);
+      
+      // Clear stored stream info if this was the last stream (legacy storage)
+      // Note: In multi-stream mode, we may want to keep storage per-stream
+      // For now, we'll keep the legacy behavior but it only affects the last stream
+    }
+    
+    console.log('[Whatnot Pulse] Stream session reset complete for:', streamId);
+  } else {
+    // Reset all streams
+    console.log('[Whatnot Pulse] Resetting ALL stream sessions - clearing all streams');
+    
+    // Stop all active viewer count updates
+    updateIntervalsMap.forEach((intervalId, sid) => {
+      clearInterval(intervalId);
+      console.log('[Whatnot Pulse] Stopped viewer count updates for stream:', sid);
+    });
+    updateIntervalsMap.clear();
+    
+    // Clear all streams from map
+    streamsMap.clear();
+    
+    // Clear stored stream info
+    chrome.storage.local.remove([
+      'current_streamer_username',
+      'current_stream_title',
+      'current_stream_url'
+    ]).catch(err => {
+      console.warn('[Whatnot Pulse] Error clearing stored stream info:', err);
+    });
+    
+    console.log('[Whatnot Pulse] All stream sessions reset complete');
+  }
 }
 
 /**
@@ -401,14 +463,18 @@ async function processQueue() {
  * Queue a sale for processing
  */
 function queueSale(sale) {
-  // Deduplication check - use streamer_username now
-  const saleSignature = `${sale.streamer_username}|${sale.item_name}|${sale.buyer_username}|${sale.timestamp || Date.now()}`;
-  const existingSale = requestQueue.find(s => 
-    `${s.streamer_username}|${s.item_name}|${s.buyer_username}|${s.timestamp || Date.now()}` === saleSignature
-  );
+  // Deduplication check - include stream_id to prevent cross-stream duplicates
+  // This ensures "iPad" sold in Stream A is not marked as duplicate of "iPad" sold in Stream B
+  const streamId = sale.stream_id || 'unknown';
+  const saleSignature = `${streamId}|${sale.streamer_username}|${sale.item_name}|${sale.buyer_username}|${sale.timestamp || Date.now()}`;
+  const existingSale = requestQueue.find(s => {
+    const existingStreamId = s.stream_id || 'unknown';
+    const existingSignature = `${existingStreamId}|${s.streamer_username}|${s.item_name}|${s.buyer_username}|${s.timestamp || Date.now()}`;
+    return existingSignature === saleSignature;
+  });
   
   if (existingSale) {
-    console.log('[Whatnot Pulse] Duplicate sale ignored:', sale);
+    console.log('[Whatnot Pulse] Duplicate sale ignored (including stream_id check):', sale);
     return;
   }
 
@@ -472,135 +538,143 @@ async function updateLiveStatus(data) {
 }
 
 /**
- * Start periodic viewer count updates
+ * Start periodic viewer count updates for a specific stream
+ * Note: For multi-stream monitoring, the heartbeat alarm is the primary mechanism.
+ * These per-stream intervals are kept for legacy compatibility.
+ * @param {string} streamId - Stream ID to start updates for
  */
-function startViewerCountUpdates() {
-  // Clear any existing interval
-  if (currentStream.updateInterval) {
-    clearInterval(currentStream.updateInterval);
+function startViewerCountUpdates(streamId) {
+  if (!streamId) {
+    console.warn('[Whatnot Pulse] startViewerCountUpdates called without streamId');
+    return;
+  }
+  
+  const streamState = getOrCreateStream(streamId);
+  if (!streamState) {
+    console.warn('[Whatnot Pulse] Could not create stream state for:', streamId);
+    return;
+  }
+  
+  // Clear any existing interval for this stream
+  const existingIntervalId = updateIntervalsMap.get(streamId);
+  if (existingIntervalId) {
+    clearInterval(existingIntervalId);
+    updateIntervalsMap.delete(streamId);
   }
 
-  // Set up periodic updates every 30 seconds
-  currentStream.updateInterval = setInterval(async () => {
-    if (!currentStream.streamer_username) {
+  // Set up periodic updates every 30 seconds for this specific stream
+  const intervalId = setInterval(async () => {
+    const currentStreamState = streamsMap.get(streamId);
+    if (!currentStreamState || !currentStreamState.streamer_username) {
       return;
     }
 
-    // Request viewer count from content script
+    // Find tab for this specific stream
     try {
       const tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/live/*'] });
-      if (tabs.length > 0) {
-        const activeTab = tabs.find(t => t.active) || tabs[0];
-        if (activeTab) {
-          chrome.tabs.sendMessage(activeTab.id, { type: 'GET_VIEWER_COUNT' }, (response) => {
-            if (chrome.runtime.lastError) {
-              console.warn('[Whatnot Pulse] Could not get viewer count:', chrome.runtime.lastError);
-              return;
-            }
-
-            if (response) {
-              const viewerCount = response.viewerCount;
-              const pendingItems = response.pendingItems;
-              
-              // Verify this tab is for the current streamer (prevent cross-stream contamination)
-              const tabUrl = activeTab.url || '';
-              const expectedStreamer = currentStream.streamer_username;
-              const urlMatchesStreamer = expectedStreamer && tabUrl.includes(`/live/`) && (
-                tabUrl.includes(expectedStreamer) || 
-                currentStream.stream_url === tabUrl
-              );
-              
-              // #region agent log
-              fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:422',message:'Received viewer count from content script',data:{viewerCount,viewerCountType:typeof viewerCount,pendingItems,currentLastViewerCount:currentStream.lastViewerCount,currentStreamer:expectedStreamer,tabUrl:tabUrl.substring(0,100),urlMatchesStreamer},timestamp:Date.now(),sessionId:'debug-session',runId:'run6',hypothesisId:'H2,H5'})}).catch(()=>{});
-              // #endregion
-              
-              // Only process if this tab matches the current stream
-              if (!expectedStreamer || !urlMatchesStreamer) {
-                // #region agent log
-                fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:430',message:'Skipping viewer count - tab does not match current stream',data:{expectedStreamer,tabUrl:tabUrl.substring(0,100),urlMatchesStreamer},timestamp:Date.now(),sessionId:'debug-session',runId:'run6',hypothesisId:'H2'})}).catch(()=>{});
-                // #endregion
-                return; // Skip this update - wrong stream
-              }
-              
-              // Always send viewer count updates (even if same value) to keep dashboard fresh
-              // Don't cache - always send the latest value from the page
-              if (viewerCount !== undefined && viewerCount !== null) {
-                const numViewers = typeof viewerCount === 'number' ? viewerCount : parseInt(viewerCount, 10);
-                if (!isNaN(numViewers) && numViewers > 0) {
-                  const previousValue = currentStream.lastViewerCount;
-                  // Always update, even if same as last time (to refresh dashboard)
-                  currentStream.lastViewerCount = numViewers;
-                  
-                  const updateData = {
-                    streamer_username: currentStream.streamer_username,
-                    is_live: true,
-                    title: currentStream.title,
-                    stream_url: currentStream.stream_url,
-                    viewer_count: numViewers
-                  };
-                  
-                  if (pendingItems !== undefined && pendingItems !== null) {
-                    updateData.pending_items = pendingItems;
-                    currentStream.lastPendingItems = pendingItems;
-                  }
-                  if (currentStream.stream_start_time) {
-                    updateData.stream_start_time = currentStream.stream_start_time;
-                  }
-                  
-                  console.log('[Whatnot Pulse] Updating viewer count:', numViewers, '(was:', previousValue, ')');
-                  // #region agent log
-                  fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:450',message:'About to send viewer count to backend',data:{viewerCount:numViewers,previousValue,streamerUsername:currentStream.streamer_username,updateData},timestamp:Date.now(),sessionId:'debug-session',runId:'run6',hypothesisId:'H5,H6'})}).catch(()=>{});
-                  // #endregion
-                  
-                  updateLiveStatus(updateData);
-                } else {
-                  // #region agent log
-                  fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:457',message:'Viewer count is NaN or <= 0',data:{viewerCount,viewerCountType:typeof viewerCount,parsed:numViewers},timestamp:Date.now(),sessionId:'debug-session',runId:'run6',hypothesisId:'H5'})}).catch(()=>{});
-                  // #endregion
-                }
-              } else {
-                // #region agent log
-                fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:460',message:'Viewer count is null/undefined from content script',data:{viewerCount,streamerUsername:currentStream.streamer_username},timestamp:Date.now(),sessionId:'debug-session',runId:'run6',hypothesisId:'H1,H4'})}).catch(()=>{});
-                // #endregion
-                console.warn('[Whatnot Pulse] Viewer count extraction returned null/undefined, keeping previous value:', currentStream.lastViewerCount);
-              }
-              
-              // Check if only pending items changed (regardless of viewer count)
-              if (pendingItems !== undefined && pendingItems !== null && pendingItems !== currentStream.lastPendingItems) {
-                // Only pending items changed
-                currentStream.lastPendingItems = pendingItems;
-                const updateData = {
-                  streamer_username: currentStream.streamer_username,
-                  is_live: true,
-                  title: currentStream.title,
-                  stream_url: currentStream.stream_url,
-                  pending_items: pendingItems
-                };
-                if (currentStream.lastViewerCount !== null) {
-                  updateData.viewer_count = currentStream.lastViewerCount;
-                }
-                if (currentStream.stream_start_time) {
-                  updateData.stream_start_time = currentStream.stream_start_time;
-                }
-                updateLiveStatus(updateData);
-              }
-            }
-          });
-        }
+      const streamTab = tabs.find(tab => {
+        if (!tab.url) return false;
+        const tabStreamId = extractStreamIdFromUrl(tab.url);
+        return tabStreamId === streamId;
+      });
+      
+      if (!streamTab) {
+        // Tab not found, stop updates for this stream
+        stopViewerCountUpdates(streamId);
+        return;
       }
+
+      chrome.tabs.sendMessage(streamTab.id, { type: 'GET_VIEWER_COUNT' }, (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn(`[Whatnot Pulse] Could not get viewer count for stream ${streamId}:`, chrome.runtime.lastError);
+          return;
+        }
+
+        if (response) {
+          const viewerCount = response.viewerCount;
+          const pendingItems = response.pendingItems;
+          
+          const streamState = streamsMap.get(streamId);
+          if (!streamState) return;
+          
+          // Always send viewer count updates (even if same value) to keep dashboard fresh
+          if (viewerCount !== undefined && viewerCount !== null) {
+            const numViewers = typeof viewerCount === 'number' ? viewerCount : parseInt(viewerCount, 10);
+            if (!isNaN(numViewers) && numViewers > 0) {
+              const previousValue = streamState.lastViewerCount;
+              streamState.lastViewerCount = numViewers;
+              
+              const updateData = {
+                streamer_username: streamState.streamer_username,
+                is_live: true,
+                title: streamState.title,
+                stream_url: streamState.stream_url,
+                stream_id: streamId,
+                viewer_count: numViewers
+              };
+              
+              if (pendingItems !== undefined && pendingItems !== null) {
+                updateData.pending_items = pendingItems;
+                streamState.lastPendingItems = pendingItems;
+              }
+              if (streamState.stream_start_time) {
+                updateData.stream_start_time = streamState.stream_start_time;
+              }
+              
+              console.log(`[Whatnot Pulse] Updating viewer count for stream ${streamId}:`, numViewers, '(was:', previousValue, ')');
+              updateLiveStatus(updateData);
+            }
+          }
+          
+          // Check if only pending items changed
+          if (pendingItems !== undefined && pendingItems !== null && pendingItems !== streamState.lastPendingItems) {
+            streamState.lastPendingItems = pendingItems;
+            const updateData = {
+              streamer_username: streamState.streamer_username,
+              is_live: true,
+              title: streamState.title,
+              stream_url: streamState.stream_url,
+              stream_id: streamId,
+              pending_items: pendingItems
+            };
+            if (streamState.lastViewerCount !== null) {
+              updateData.viewer_count = streamState.lastViewerCount;
+            }
+            if (streamState.stream_start_time) {
+              updateData.stream_start_time = streamState.stream_start_time;
+            }
+            updateLiveStatus(updateData);
+          }
+        }
+      });
     } catch (error) {
-      console.error('[Whatnot Pulse] Error getting viewer count:', error);
+      console.error(`[Whatnot Pulse] Error getting viewer count for stream ${streamId}:`, error);
     }
   }, CONFIG.VIEWER_COUNT_INTERVAL);
+  
+  updateIntervalsMap.set(streamId, intervalId);
+  console.log(`[Whatnot Pulse] Started viewer count updates for stream:`, streamId);
 }
 
 /**
- * Stop viewer count updates
+ * Stop viewer count updates for a specific stream
+ * @param {string} streamId - Stream ID to stop updates for
  */
-function stopViewerCountUpdates() {
-  if (currentStream.updateInterval) {
-    clearInterval(currentStream.updateInterval);
-    currentStream.updateInterval = null;
+function stopViewerCountUpdates(streamId) {
+  if (streamId) {
+    const intervalId = updateIntervalsMap.get(streamId);
+    if (intervalId) {
+      clearInterval(intervalId);
+      updateIntervalsMap.delete(streamId);
+      console.log(`[Whatnot Pulse] Stopped viewer count updates for stream:`, streamId);
+    }
+  } else {
+    // Legacy: stop all if no streamId provided
+    updateIntervalsMap.forEach((intervalId, sid) => {
+      clearInterval(intervalId);
+      console.log(`[Whatnot Pulse] Stopped viewer count updates for stream:`, sid);
+    });
+    updateIntervalsMap.clear();
   }
 }
 
@@ -617,9 +691,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (message.type === 'NEW_SALE') {
         console.log('[Whatnot Pulse] Background received NEW_SALE message:', message);
         
+        // Extract stream_id from sender tab URL for session isolation
+        let senderStreamId = null;
+        if (sender && sender.tab && sender.tab.url) {
+          senderStreamId = extractStreamIdFromUrl(sender.tab.url);
+          if (senderStreamId) {
+            console.log('[Whatnot Pulse] Extracted stream_id from sender tab:', senderStreamId);
+          }
+        }
+        
         // Handle single sale or array of sales
         const sales = Array.isArray(message.sales) ? message.sales : [message.sale || message];
-        console.log('[Whatnot Pulse] Processing', sales.length, 'sales');
+        console.log('[Whatnot Pulse] Processing', sales.length, 'sales for stream:', senderStreamId || 'unknown');
         
         let queued = 0;
         let invalid = 0;
@@ -630,6 +713,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             console.warn('[Whatnot Pulse] Invalid sale data:', sale);
             invalid++;
             continue;
+          }
+          
+          // Associate sale with specific stream_id for session isolation
+          if (senderStreamId && !sale.stream_id) {
+            sale.stream_id = senderStreamId;
           }
           
           console.log('[Whatnot Pulse] Queueing sale:', sale);
@@ -665,24 +753,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Extract stream_id if available
         const streamId = historyData.stream_id || (historyData.stream_url ? extractStreamIdFromUrl(historyData.stream_url) : null);
         
-        // Store stream_id in currentStream if this is the current stream
-        if (streamId && (!currentStream.stream_id || 
-            currentStream.stream_url === historyData.stream_url)) {
-          currentStream.stream_id = streamId;
+        // Store stream_id in streamsMap if this is a tracked stream
+        if (streamId) {
+          // Get or create stream state for this stream
+          const streamState = getOrCreateStream(streamId);
+          if (historyData.stream_url) {
+            streamState.stream_url = historyData.stream_url;
+          }
+          streamsMap.set(streamId, streamState);
         }
         
         // Update stream_start_time if provided (accept historical times)
-        if (historyData.stream_start_time) {
+        if (historyData.stream_start_time && streamId) {
           const streamStart = new Date(historyData.stream_start_time);
           const now = new Date();
           const hoursSinceStart = (now - streamStart) / (1000 * 60 * 60);
           
           // For full history, accept times up to 7 days old
           if (hoursSinceStart >= 0 && hoursSinceStart <= 168) {
-            if (!currentStream.stream_start_time || 
-                currentStream.stream_url === historyData.stream_url) {
-              currentStream.stream_start_time = historyData.stream_start_time;
-              console.log('[Whatnot Pulse] Set stream_start_time from full history:', historyData.stream_start_time, `(${hoursSinceStart.toFixed(2)}h ago)`);
+            const streamState = streamsMap.get(streamId);
+            if (streamState) {
+              streamState.stream_start_time = historyData.stream_start_time;
+              streamsMap.set(streamId, streamState);
+              console.log('[Whatnot Pulse] Set stream_start_time from full history for stream', streamId, ':', historyData.stream_start_time, `(${hoursSinceStart.toFixed(2)}h ago)`);
             }
           }
         }
@@ -721,41 +814,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:578',message:'STREAM_DETECTED message received',data:{username:message.data?.username,viewerCount:message.data?.viewerCount,title:message.data?.title,streamUrl:message.data?.url},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
         // #endregion
         
-        // Clean Slate Architecture: Reset session immediately before processing new stream data
-        // This ensures no "Ghost State" persists from previous streams
-        resetStreamSession();
-        
         // Stream detected on live page
         const streamData = message.data;
         
         // Extract stream_id from URL if available
         const streamId = streamData.url ? extractStreamIdFromUrl(streamData.url) : null;
         
-        // Initialize currentStream if needed
-        if (!currentStream) {
-          currentStream = {
-            streamer_username: null,
-            title: null,
-            stream_url: null,
-            stream_id: null,
-            lastViewerCount: null,
-            lastPendingItems: null,
-            updateInterval: null,
-            stream_start_time: null
-          };
+        if (!streamId) {
+          console.warn('[Whatnot Pulse] STREAM_DETECTED received but could not extract stream_id from URL:', streamData.url);
+          sendResponse({ success: false, error: 'Could not extract stream_id from URL' });
+          return;
         }
         
-        currentStream.streamer_username = streamData.username;
-        currentStream.title = streamData.title || null;
-        currentStream.stream_url = streamData.url || null;
-        currentStream.stream_id = streamId || null;
-        currentStream.lastViewerCount = streamData.viewerCount || null;
-        currentStream.lastPendingItems = streamData.pendingItems !== undefined ? streamData.pendingItems : null;
+        // Clean Slate Architecture: Reset session for THIS specific stream only
+        // This ensures no "Ghost State" persists for this stream, but other streams continue
+        resetStreamSession(streamId);
+        
+        // Get or create stream state in map
+        const streamState = getOrCreateStream(streamId);
+        
+        // Update stream state with new data
+        streamState.streamer_username = streamData.username;
+        streamState.title = streamData.title || null;
+        streamState.stream_url = streamData.url || null;
+        streamState.stream_id = streamId;
+        streamState.lastViewerCount = streamData.viewerCount || null;
+        streamState.lastPendingItems = streamData.pendingItems !== undefined ? streamData.pendingItems : null;
         
         // Check if this is a historical pull (indicated by historical_mode flag or stream_start_time > 12h)
         const isHistoricalPull = streamData.historical_mode === true;
         
-        // Only set stream_start_time if it's currently null (clean slate)
+        // Set stream_start_time if provided and valid
         // For historical pulls, accept times up to 7 days old
         // For live monitoring, accept times within last 12 hours
         if (streamData.stream_start_time) {
@@ -766,19 +855,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           
           // Validate: must be within time window
           if (hoursSinceStart >= 0 && hoursSinceStart <= maxHoursAgo) {
-            // Since we reset at the beginning, always set if valid
-            currentStream.stream_start_time = streamData.stream_start_time;
-            console.log('[Whatnot Pulse] Set stream_start_time:', streamData.stream_start_time, `(${hoursSinceStart.toFixed(2)}h ago, historical: ${isHistoricalPull})`);
+            streamState.stream_start_time = streamData.stream_start_time;
+            console.log('[Whatnot Pulse] Set stream_start_time for stream', streamId, ':', streamData.stream_start_time, `(${hoursSinceStart.toFixed(2)}h ago, historical: ${isHistoricalPull})`);
           } else {
-            console.warn('[Whatnot Pulse] Rejected stream_start_time - outside validation window:', hoursSinceStart.toFixed(2), 'hours (max:', maxHoursAgo, 'h)');
-            currentStream.stream_start_time = null;
+            console.warn('[Whatnot Pulse] Rejected stream_start_time for stream', streamId, '- outside validation window:', hoursSinceStart.toFixed(2), 'hours (max:', maxHoursAgo, 'h)');
+            streamState.stream_start_time = null;
           }
         } else {
-          // If no start time provided, keep as null (already reset)
-          currentStream.stream_start_time = null;
+          // If no start time provided, keep as null
+          streamState.stream_start_time = null;
         }
 
-        console.log('[Whatnot Pulse] Updated currentStream:', currentStream);
+        // Store stream state in map
+        streamsMap.set(streamId, streamState);
+        console.log('[Whatnot Pulse] Updated stream state in map for:', streamId, streamState);
 
         // Add streamer to watched list if not already there
         const watchedResult = await chrome.storage.local.get(['watched_streamers']);
@@ -789,20 +879,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           console.log('[Whatnot Pulse] Added', streamData.username, 'to watched streamers list');
         }
 
-        // Store current stream info
+        // Store current stream info (legacy storage - for backward compatibility)
         await chrome.storage.local.set({ 
           current_streamer_username: streamData.username,
           current_stream_title: streamData.title,
           current_stream_url: streamData.url
         });
-        console.log('[Whatnot Pulse] Stored stream info in chrome.storage');
+        console.log('[Whatnot Pulse] Stored stream info in chrome.storage for stream:', streamId);
         
         // Report stream is live with active status
         const updateData = {
           streamer_username: streamData.username,
           is_live: true,
           title: streamData.title,
-          stream_url: streamData.url
+          stream_url: streamData.url,
+          stream_id: streamId // Include stream_id for multi-stream support
         };
         if (streamData.viewerCount !== undefined && streamData.viewerCount !== null) {
           // Ensure viewer_count is a number
@@ -814,57 +905,60 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (streamData.pendingItems !== undefined && streamData.pendingItems !== null) {
           updateData.pending_items = streamData.pendingItems;
         }
-        if (streamData.stream_start_time) {
-          updateData.stream_start_time = streamData.stream_start_time;
+        if (streamState.stream_start_time) {
+          updateData.stream_start_time = streamState.stream_start_time;
         }
         
-        console.log('[Whatnot Pulse] Calling updateLiveStatus with:', updateData);
+        console.log('[Whatnot Pulse] Calling updateLiveStatus for stream', streamId, 'with:', updateData);
         
         const updateResult = await updateLiveStatus(updateData);
         
-        console.log('[Whatnot Pulse] updateLiveStatus result:', updateResult);
+        console.log('[Whatnot Pulse] updateLiveStatus result for stream', streamId, ':', updateResult);
         
-        // Start periodic viewer count updates and heartbeat
-        startViewerCountUpdates();
-        console.log('[Whatnot Pulse] Started viewer count updates and heartbeat');
+        // Start periodic viewer count updates for THIS specific stream
+        startViewerCountUpdates(streamId);
+        console.log('[Whatnot Pulse] Started viewer count updates for stream:', streamId);
         
         // Automatically trigger full history extraction 5 seconds after stream detection
         // This ensures we capture all sales even if joining mid-stream
         setTimeout(async () => {
           try {
-            // Find the active live stream tab
+            // Find the tab for this specific stream
             const tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/live/*', '*://www.whatnot.com/live/*'] });
-            const activeTab = tabs.find(t => t.active && t.url && t.url.includes('/live/')) || 
-                             tabs.find(t => t.url && t.url.includes('/live/'));
+            const streamTab = tabs.find(t => {
+              if (!t.url) return false;
+              const tabStreamId = extractStreamIdFromUrl(t.url);
+              return tabStreamId === streamId;
+            });
             
-            if (activeTab && activeTab.id) {
-              console.log('[Whatnot Pulse] Automatically triggering full history extraction for tab:', activeTab.id);
+            if (streamTab && streamTab.id) {
+              console.log('[Whatnot Pulse] Automatically triggering full history extraction for stream', streamId, 'tab:', streamTab.id);
               try {
                 // Try to send message to content script (if already loaded)
-                await chrome.tabs.sendMessage(activeTab.id, { type: 'EXTRACT_FULL_HISTORY' });
-                console.log('[Whatnot Pulse] Sent EXTRACT_FULL_HISTORY message to tab', activeTab.id);
+                await chrome.tabs.sendMessage(streamTab.id, { type: 'EXTRACT_FULL_HISTORY' });
+                console.log('[Whatnot Pulse] Sent EXTRACT_FULL_HISTORY message to tab', streamTab.id);
               } catch (msgError) {
                 // Content script not loaded yet, inject it
                 console.log('[Whatnot Pulse] Content script not loaded, injecting for full history extraction...');
                 try {
                   await chrome.scripting.executeScript({
-                    target: { tabId: activeTab.id },
+                    target: { tabId: streamTab.id },
                     files: ['content.js']
                   });
                   // Wait for script to initialize
                   await new Promise(resolve => setTimeout(resolve, 1000));
                   // Now send message
-                  await chrome.tabs.sendMessage(activeTab.id, { type: 'EXTRACT_FULL_HISTORY' });
+                  await chrome.tabs.sendMessage(streamTab.id, { type: 'EXTRACT_FULL_HISTORY' });
                   console.log('[Whatnot Pulse] Sent EXTRACT_FULL_HISTORY message after injection');
                 } catch (injectError) {
                   console.warn('[Whatnot Pulse] Error injecting script for automatic full history extraction:', injectError);
                 }
               }
             } else {
-              console.warn('[Whatnot Pulse] No active live stream tab found for automatic full history extraction');
+              console.warn('[Whatnot Pulse] No tab found for stream', streamId, 'for automatic full history extraction');
             }
           } catch (error) {
-            console.error('[Whatnot Pulse] Error triggering automatic full history extraction:', error);
+            console.error('[Whatnot Pulse] Error triggering automatic full history extraction for stream', streamId, ':', error);
           }
         }, 5000); // 5 second delay
         
@@ -873,67 +967,81 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       else if (message.type === 'VIEWER_COUNT_UPDATE') {
         // Viewer count and pending items updated from content script
+        // Extract stream_id from sender tab for multi-stream support
+        let senderStreamId = null;
+        if (sender && sender.tab && sender.tab.url) {
+          senderStreamId = extractStreamIdFromUrl(sender.tab.url);
+        }
+        
         // #region agent log
-        fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:656',message:'VIEWER_COUNT_UPDATE message received',data:{viewerCount:message.viewerCount,currentLastViewerCount:currentStream?.lastViewerCount,streamerUsername:currentStream?.streamer_username,hasStreamerUsername:!!currentStream?.streamer_username},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H2,H5'})}).catch(()=>{});
+        fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:656',message:'VIEWER_COUNT_UPDATE message received',data:{viewerCount:message.viewerCount,streamId:senderStreamId},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H2,H5'})}).catch(()=>{});
         // #endregion
         
-        if (!currentStream || !currentStream.streamer_username) {
-          // #region agent log
-          fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:662',message:'VIEWER_COUNT_UPDATE skipped - no current stream',data:{viewerCount:message.viewerCount},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
-          // #endregion
-          console.warn('[Whatnot Pulse] VIEWER_COUNT_UPDATE received but no current stream set - waiting for STREAM_DETECTED');
+        if (!senderStreamId) {
+          console.warn('[Whatnot Pulse] VIEWER_COUNT_UPDATE received but could not extract stream_id from sender tab');
           sendResponse({ success: true });
           return;
         }
         
-        if (currentStream.streamer_username) {
-          const viewerChanged = message.viewerCount !== undefined && message.viewerCount !== currentStream.lastViewerCount;
-          const pendingChanged = message.pendingItems !== undefined && message.pendingItems !== currentStream.lastPendingItems;
-          
+        // Get stream state from map
+        const streamState = streamsMap.get(senderStreamId);
+        if (!streamState || !streamState.streamer_username) {
           // #region agent log
-          fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:616',message:'VIEWER_COUNT_UPDATE change check',data:{viewerChanged,pendingChanged,newViewerCount:message.viewerCount,oldViewerCount:currentStream.lastViewerCount},timestamp:Date.now(),sessionId:'debug-session',runId:'run5',hypothesisId:'H2'})}).catch(()=>{});
+          fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:662',message:'VIEWER_COUNT_UPDATE skipped - stream not in map',data:{viewerCount:message.viewerCount,streamId:senderStreamId},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
+          // #endregion
+          console.warn('[Whatnot Pulse] VIEWER_COUNT_UPDATE received for stream', senderStreamId, 'but stream not in map - waiting for STREAM_DETECTED');
+          sendResponse({ success: true });
+          return;
+        }
+        
+        const viewerChanged = message.viewerCount !== undefined && message.viewerCount !== streamState.lastViewerCount;
+        const pendingChanged = message.pendingItems !== undefined && message.pendingItems !== streamState.lastPendingItems;
+        
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:616',message:'VIEWER_COUNT_UPDATE change check',data:{viewerChanged,pendingChanged,newViewerCount:message.viewerCount,oldViewerCount:streamState.lastViewerCount,streamId:senderStreamId},timestamp:Date.now(),sessionId:'debug-session',runId:'run5',hypothesisId:'H2'})}).catch(()=>{});
+        // #endregion
+        
+        // Always send updates (even if same value) to keep dashboard fresh
+        // Update stored values
+        if (message.viewerCount !== undefined) streamState.lastViewerCount = message.viewerCount;
+        if (message.pendingItems !== undefined) streamState.lastPendingItems = message.pendingItems;
+        if (message.stream_start_time !== undefined) streamState.stream_start_time = message.stream_start_time;
+        streamsMap.set(senderStreamId, streamState);
+        
+        const updateData = {
+          streamer_username: streamState.streamer_username,
+          stream_id: senderStreamId,
+          is_live: true,
+          title: streamState.title,
+          stream_url: streamState.stream_url
+        };
+        
+        // Ensure viewer_count is a number
+        if (message.viewerCount !== undefined && message.viewerCount !== null) {
+          const numViewers = typeof message.viewerCount === 'number' ? message.viewerCount : parseInt(message.viewerCount, 10);
+          if (!isNaN(numViewers)) {
+            // Allow 0 viewers (stream might be just starting)
+            updateData.viewer_count = numViewers;
+          }
+        }
+        if (message.pendingItems !== undefined && message.pendingItems !== null) {
+          updateData.pending_items = message.pendingItems;
+        }
+        if (streamState.stream_start_time) {
+          updateData.stream_start_time = streamState.stream_start_time;
+        }
+        
+        // Only send if we have viewer_count
+        if (updateData.viewer_count !== undefined) {
+          // #region agent log
+          fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:680',message:'VIEWER_COUNT_UPDATE calling updateLiveStatus',data:{updateData,streamId:senderStreamId},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
           // #endregion
           
-          // Always send updates (even if same value) to keep dashboard fresh
-          // Update stored values
-          if (message.viewerCount !== undefined) currentStream.lastViewerCount = message.viewerCount;
-          if (message.pendingItems !== undefined) currentStream.lastPendingItems = message.pendingItems;
-          if (message.stream_start_time !== undefined) currentStream.stream_start_time = message.stream_start_time;
-          
-          const updateData = {
-            streamer_username: currentStream.streamer_username,
-            is_live: true,
-            title: currentStream.title,
-            stream_url: currentStream.stream_url
-          };
-          
-          // Ensure viewer_count is a number
-          if (message.viewerCount !== undefined && message.viewerCount !== null) {
-            const numViewers = typeof message.viewerCount === 'number' ? message.viewerCount : parseInt(message.viewerCount, 10);
-            if (!isNaN(numViewers)) {
-              // Allow 0 viewers (stream might be just starting)
-              updateData.viewer_count = numViewers;
-            }
-          }
-          if (message.pendingItems !== undefined && message.pendingItems !== null) {
-            updateData.pending_items = message.pendingItems;
-          }
-          if (currentStream.stream_start_time) {
-            updateData.stream_start_time = currentStream.stream_start_time;
-          }
-          
-          // Only send if we have viewer_count
-          if (updateData.viewer_count !== undefined) {
-            // #region agent log
-            fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:680',message:'VIEWER_COUNT_UPDATE calling updateLiveStatus',data:{updateData},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
-            // #endregion
-            
-            await updateLiveStatus(updateData);
-          } else {
-            // #region agent log
-            fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:688',message:'VIEWER_COUNT_UPDATE skipped - no viewer count',data:{viewerCount:message.viewerCount,viewerCountType:typeof message.viewerCount},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
-            // #endregion
-          }
+          await updateLiveStatus(updateData);
+        } else {
+          // #region agent log
+          fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:688',message:'VIEWER_COUNT_UPDATE skipped - no viewer count',data:{viewerCount:message.viewerCount,viewerCountType:typeof message.viewerCount,streamId:senderStreamId},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
+          // #endregion
         }
         
         sendResponse({ success: true });
@@ -1070,35 +1178,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       
       else if (message.type === 'STREAM_LEFT') {
-        // User left the live stream page
-        if (currentStream && currentStream.streamer_username) {
-          console.log('[Whatnot Pulse] Stream left, marking as offline');
-          const updateData = {
-            streamer_username: currentStream.streamer_username,
-            is_live: false
-          };
-          // Include stream_start_time if available so backend can calculate duration correctly
-          if (currentStream.stream_start_time) {
-            updateData.stream_start_time = currentStream.stream_start_time;
+        // User left the live stream page - extract stream_id from sender tab
+        let senderStreamId = null;
+        if (sender && sender.tab && sender.tab.url) {
+          senderStreamId = extractStreamIdFromUrl(sender.tab.url);
+        }
+        
+        if (senderStreamId) {
+          const streamState = streamsMap.get(senderStreamId);
+          if (streamState && streamState.streamer_username) {
+            console.log('[Whatnot Pulse] Stream', senderStreamId, 'left, marking as offline');
+            const updateData = {
+              streamer_username: streamState.streamer_username,
+              stream_id: senderStreamId,
+              is_live: false
+            };
+            // Include stream_start_time if available so backend can calculate duration correctly
+            if (streamState.stream_start_time) {
+              updateData.stream_start_time = streamState.stream_start_time;
+            }
+            await updateLiveStatus(updateData);
+            
+            // Clear update interval for this stream only
+            stopViewerCountUpdates(senderStreamId);
+            
+            // Reset session for this stream only (other streams continue)
+            resetStreamSession(senderStreamId);
+          } else {
+            console.warn('[Whatnot Pulse] STREAM_LEFT received for stream', senderStreamId, 'but stream not in map');
           }
-          await updateLiveStatus(updateData);
-          
-          // Clear update interval
-          stopViewerCountUpdates();
-          
-          // Clear current stream
-          currentStream.streamer_username = null;
-          currentStream.title = null;
-          currentStream.stream_url = null;
-          currentStream.lastViewerCount = null;
-          currentStream.lastPendingItems = null;
-          currentStream.stream_start_time = null;
-          
-          await chrome.storage.local.remove([
-            'current_streamer_username',
-            'current_stream_title',
-            'current_stream_url'
-          ]);
+        } else {
+          console.warn('[Whatnot Pulse] STREAM_LEFT received but could not extract stream_id from sender tab');
         }
         sendResponse({ success: true });
       }
@@ -1323,15 +1433,23 @@ chrome.runtime.onStartup.addListener(() => {
     loadConfig().catch(err => {
       console.warn('[Whatnot Pulse] Error loading config on startup:', err);
     }).then(() => {
-      // Load current stream state on startup
+      // Load current stream state on startup (legacy support)
+      // Note: In multi-stream mode, streams are re-initialized via STREAM_DETECTED messages
+      // This legacy code is kept for backward compatibility but may not be reliable for multi-stream
       chrome.storage.local.get(['current_streamer_username', 'current_stream_title', 'current_stream_url']).then(result => {
-        if (result.current_streamer_username) {
-          currentStream.streamer_username = result.current_streamer_username;
-          currentStream.title = result.current_stream_title;
-          currentStream.stream_url = result.current_stream_url;
-          // Note: We don't automatically restart viewer count updates on service worker restart
-          // They will restart when content script sends STREAM_DETECTED message
+        if (result.current_stream_url) {
+          const streamId = extractStreamIdFromUrl(result.current_stream_url);
+          if (streamId) {
+            const streamState = getOrCreateStream(streamId);
+            streamState.streamer_username = result.current_streamer_username || null;
+            streamState.title = result.current_stream_title || null;
+            streamState.stream_url = result.current_stream_url || null;
+            streamsMap.set(streamId, streamState);
+            console.log('[Whatnot Pulse] Restored stream state on startup for:', streamId);
+          }
         }
+        // Note: We don't automatically restart viewer count updates on service worker restart
+        // They will restart when content script sends STREAM_DETECTED message
       }).catch(err => {
         console.warn('[Whatnot Pulse] Error loading stream state on startup:', err);
       });
@@ -1345,15 +1463,23 @@ chrome.runtime.onInstalled.addListener(() => {
     loadConfig().catch(err => {
       console.warn('[Whatnot Pulse] Error loading config on install:', err);
     }).then(() => {
-      // Load current stream state on startup
+      // Load current stream state on startup (legacy support)
+      // Note: In multi-stream mode, streams are re-initialized via STREAM_DETECTED messages
+      // This legacy code is kept for backward compatibility but may not be reliable for multi-stream
       chrome.storage.local.get(['current_streamer_username', 'current_stream_title', 'current_stream_url']).then(result => {
-        if (result.current_streamer_username) {
-          currentStream.streamer_username = result.current_streamer_username;
-          currentStream.title = result.current_stream_title;
-          currentStream.stream_url = result.current_stream_url;
-          // Note: We don't automatically restart viewer count updates on service worker restart
-          // They will restart when content script sends STREAM_DETECTED message
+        if (result.current_stream_url) {
+          const streamId = extractStreamIdFromUrl(result.current_stream_url);
+          if (streamId) {
+            const streamState = getOrCreateStream(streamId);
+            streamState.streamer_username = result.current_streamer_username || null;
+            streamState.title = result.current_stream_title || null;
+            streamState.stream_url = result.current_stream_url || null;
+            streamsMap.set(streamId, streamState);
+            console.log('[Whatnot Pulse] Restored stream state on install for:', streamId);
+          }
         }
+        // Note: We don't automatically restart viewer count updates on service worker restart
+        // They will restart when content script sends STREAM_DETECTED message
       }).catch(err => {
         console.warn('[Whatnot Pulse] Error loading stream state on install:', err);
       });
@@ -1555,7 +1681,7 @@ async function checkLiveStreams() {
   // #endregion
 }
 
-// Session Manager: Monitor tab updates to detect stream changes
+// Session Manager: Monitor tab updates to detect stream changes (Multi-Stream Support)
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   // Reset immediately if URL changed (before page finishes loading)
   // This prevents "Ghost State" - lingering data from old tabs
@@ -1568,26 +1694,46 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       // Extract stream ID from new URL
       const newStreamId = extractStreamIdFromUrl(newUrl);
       
-      // If stream ID changed, reset immediately (most reliable check)
-      if (newStreamId && currentStream.stream_id && currentStream.stream_id !== newStreamId) {
-        console.log('[Whatnot Pulse] Livestream ID changed, resetting session immediately (Accuracy First)');
-        console.log('[Whatnot Pulse] Previous stream ID:', currentStream.stream_id, 'New stream ID:', newStreamId);
-        resetStreamSession();
+      if (newStreamId) {
+        // Find existing stream for this tab (look up by matching URL)
+        // Note: We need to check all streams since we don't have tab-to-stream mapping
+        let existingStreamId = null;
+        let existingStreamState = null;
+        
+        for (const [streamId, streamState] of streamsMap.entries()) {
+          // Check if any tab matches this URL (we can't directly map tab to stream without checking URL)
+          // For now, if stream_id changed, we know it's a different stream
+          if (streamState.stream_url === newUrl) {
+            existingStreamId = streamId;
+            existingStreamState = streamState;
+            break;
+          }
+        }
+        
+        // If stream ID changed or URL changed, reset this specific stream
+        if (existingStreamId && existingStreamId !== newStreamId) {
+          console.log('[Whatnot Pulse] Livestream ID changed for tab', tabId, '- resetting old stream:', existingStreamId);
+          console.log('[Whatnot Pulse] Previous stream ID:', existingStreamId, 'New stream ID:', newStreamId);
+          resetStreamSession(existingStreamId); // Reset old stream
+        } else if (existingStreamId && existingStreamState && existingStreamState.stream_url !== newUrl) {
+          console.log('[Whatnot Pulse] URL changed for stream', existingStreamId, '- resetting session');
+          console.log('[Whatnot Pulse] Previous:', existingStreamState.stream_url, 'New:', newUrl);
+          resetStreamSession(existingStreamId); // Reset this specific stream
+        }
+        // If newStreamId is new (not in map), let STREAM_DETECTED handler create it
       }
-      
-      // Also check URL change as fallback
-      if (currentStream.stream_url && currentStream.stream_url !== newUrl) {
-        console.log('[Whatnot Pulse] URL changed, resetting session immediately (Ghost State prevention)');
-        console.log('[Whatnot Pulse] Previous:', currentStream.stream_url, 'New:', newUrl);
-        resetStreamSession();
+    } else {
+      // If navigating away from live stream, find and reset the stream for this tab
+      // Check all streams to find which one was in this tab
+      const oldUrl = tab.url;
+      if (oldUrl && oldUrl.includes('/live/')) {
+        const oldStreamId = extractStreamIdFromUrl(oldUrl);
+        if (oldStreamId && streamsMap.has(oldStreamId)) {
+          console.log('[Whatnot Pulse] Navigated away from live stream', oldStreamId, 'in tab', tabId, '- resetting session');
+          resetStreamSession(oldStreamId); // Reset only this stream
+          return;
+        }
       }
-    }
-    
-    // If navigating away from live stream, reset immediately
-    if (!isLiveStream && currentStream.stream_url) {
-      console.log('[Whatnot Pulse] Navigated away from live stream, resetting session immediately');
-      resetStreamSession();
-      return;
     }
   }
   
@@ -1596,32 +1742,33 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     const url = tab.url;
     const isLiveStream = url.includes('/live/');
     
-    // If navigating away from live stream, reset session (redundant but safe)
-    if (!isLiveStream && currentStream.stream_url) {
-      console.log('[Whatnot Pulse] Tab finished loading - not a live stream, ensuring session is reset');
-      resetStreamSession();
-      return;
+    if (!isLiveStream) {
+      // Check if we were tracking a stream in this tab
+      const oldStreamId = changeInfo.url ? extractStreamIdFromUrl(changeInfo.url) : null;
+      if (oldStreamId && streamsMap.has(oldStreamId)) {
+        console.log('[Whatnot Pulse] Tab', tabId, 'finished loading - not a live stream, ensuring stream', oldStreamId, 'is reset');
+        resetStreamSession(oldStreamId); // Reset only this stream
+        return;
+      }
     }
     
     // If navigating to a live stream, check if it's a different stream
     if (isLiveStream) {
-      const streamerInUrl = extractStreamerFromUrl(url);
-      const currentStreamer = currentStream.streamer_username;
-      const currentUrl = currentStream.stream_url;
+      const newStreamId = extractStreamIdFromUrl(url);
+      if (!newStreamId) return;
       
-      // If URL changed to a different stream, reset session
-      if (currentUrl && currentUrl !== url) {
-        console.log('[Whatnot Pulse] Stream URL changed after page load, resetting session');
-        console.log('[Whatnot Pulse] Previous:', currentUrl, 'New:', url);
-        resetStreamSession();
+      // Find if we have a stream state for this stream
+      const streamState = streamsMap.get(newStreamId);
+      if (streamState) {
+        const streamerInUrl = extractStreamerFromUrl(url);
+        const currentStreamer = streamState.streamer_username;
+        const currentUrl = streamState.stream_url;
+        
+        // If URL changed to a different stream URL (same stream_id), no reset needed
+        // If streamer changed, that's also handled by stream_id change
+        // Stream ID is the primary key - if it matches, it's the same stream
       }
-      
-      // If streamer username changed, reset session
-      if (currentStreamer && streamerInUrl && currentStreamer !== streamerInUrl) {
-        console.log('[Whatnot Pulse] Streamer changed after page load, resetting session');
-        console.log('[Whatnot Pulse] Previous streamer:', currentStreamer, 'New:', streamerInUrl);
-        resetStreamSession();
-      }
+      // If stream not in map, STREAM_DETECTED handler will create it
     }
   }
 });
@@ -1675,44 +1822,82 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
   }
   else if (alarm.name === 'heartbeat') {
-    // Send heartbeat to keep connection alive if we have an active stream
-    if (currentStream && currentStream.streamer_username) {
-      try {
-        const tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/*', '*://www.whatnot.com/*'] });
-        const liveTabs = tabs.filter(tab => tab.url && tab.url.includes('/live/'));
-        
-        if (liveTabs.length > 0) {
-          // Check if stream is actually still live by querying content scripts
-          let streamIsActuallyLive = false;
-          let latestViewerCount = currentStream.lastViewerCount;
-          let latestStreamStartTime = currentStream.stream_start_time;
-          
-          for (const tab of liveTabs) {
-            try {
-              const response = await chrome.tabs.sendMessage(tab.id, { type: 'CHECK_STREAM_STATUS' });
-              if (response && response.isLive) {
-                streamIsActuallyLive = true;
-                if (response.viewerCount !== undefined) latestViewerCount = response.viewerCount;
-                if (response.stream_start_time) latestStreamStartTime = response.stream_start_time;
-                break; // Found live stream, no need to check others
-              }
-            } catch (err) {
-              // Tab might not have content script loaded, continue checking
-              console.warn(`[Whatnot Pulse] Could not check stream status in tab ${tab.id}:`, err);
+    // Multi-stream heartbeat: Process ALL open live stream tabs independently
+    try {
+      // Query ALL live stream tabs
+      const tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/live/*', '*://www.whatnot.com/live/*'] });
+      const liveTabs = tabs.filter(tab => tab.url && tab.url.includes('/live/'));
+      
+      if (liveTabs.length === 0) {
+        // No live tabs open - mark all tracked streams as ended
+        for (const [streamId, streamState] of streamsMap.entries()) {
+          if (streamState.streamer_username) {
+            console.log('[Whatnot Pulse] Heartbeat: No live tabs, marking stream', streamId, 'as ended');
+            const updateData = {
+              streamer_username: streamState.streamer_username,
+              stream_id: streamId,
+              is_live: false
+            };
+            if (streamState.stream_start_time) {
+              updateData.stream_start_time = streamState.stream_start_time;
             }
+            await updateLiveStatus(updateData);
+            stopViewerCountUpdates(streamId);
+            resetStreamSession(streamId);
+          }
+        }
+        return;
+      }
+      
+      // Process EACH tab independently (multi-stream support)
+      // NO BREAK statement - continue processing all streams
+      for (const tab of liveTabs) {
+        try {
+          // Extract stream_id from this tab's URL
+          const streamId = extractStreamIdFromUrl(tab.url);
+          if (!streamId) {
+            console.warn('[Whatnot Pulse] Heartbeat: Could not extract stream_id from tab:', tab.url);
+            continue; // Skip this tab
           }
           
-          // Update stored values
-          if (latestViewerCount !== null) currentStream.lastViewerCount = latestViewerCount;
-          if (latestStreamStartTime) currentStream.stream_start_time = latestStreamStartTime;
+          // Get stream state from map
+          const streamState = streamsMap.get(streamId);
+          if (!streamState || !streamState.streamer_username) {
+            // Stream not in map yet - might be a new tab, skip for now
+            continue;
+          }
+          
+          // Check if stream is actually still live by querying content script for THIS tab
+          let streamIsActuallyLive = false;
+          let latestViewerCount = streamState.lastViewerCount;
+          let latestStreamStartTime = streamState.stream_start_time;
+          
+          try {
+            const response = await chrome.tabs.sendMessage(tab.id, { type: 'CHECK_STREAM_STATUS' });
+            if (response && response.isLive) {
+              streamIsActuallyLive = true;
+              if (response.viewerCount !== undefined) latestViewerCount = response.viewerCount;
+              if (response.stream_start_time) latestStreamStartTime = response.stream_start_time;
+            }
+          } catch (err) {
+            // Tab might not have content script loaded, assume stream is still live
+            console.warn(`[Whatnot Pulse] Could not check stream status for stream ${streamId} in tab ${tab.id}:`, err);
+            streamIsActuallyLive = true; // Assume live if we can't check
+          }
+          
+          // Update stored values for this stream
+          if (latestViewerCount !== null) streamState.lastViewerCount = latestViewerCount;
+          if (latestStreamStartTime) streamState.stream_start_time = latestStreamStartTime;
+          streamsMap.set(streamId, streamState);
           
           if (streamIsActuallyLive) {
-            // Send heartbeat update
+            // Send heartbeat update for THIS stream
             const updateData = {
-              streamer_username: currentStream.streamer_username,
+              streamer_username: streamState.streamer_username,
+              stream_id: streamId,
               is_live: true,
-              title: currentStream.title,
-              stream_url: currentStream.stream_url
+              title: streamState.title,
+              stream_url: streamState.stream_url
             };
             // Ensure viewer_count is a number
             if (latestViewerCount !== null && latestViewerCount !== undefined) {
@@ -1721,86 +1906,40 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
                 updateData.viewer_count = numViewers;
               }
             }
-            if (currentStream.lastPendingItems !== null) updateData.pending_items = currentStream.lastPendingItems;
+            if (streamState.lastPendingItems !== null) updateData.pending_items = streamState.lastPendingItems;
             if (latestStreamStartTime) updateData.stream_start_time = latestStreamStartTime;
             
+            console.log('[Whatnot Pulse] Heartbeat: Sending update for stream', streamId);
             await updateLiveStatus(updateData);
-
-            // Request viewer count updates from content scripts
-            liveTabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, { type: 'GET_VIEWER_COUNT' }).catch(err => {
-                console.warn(`[Whatnot Pulse] Could not send GET_VIEWER_COUNT to tab ${tab.id}:`, err);
-              });
+            
+            // Request viewer count update from THIS tab's content script
+            chrome.tabs.sendMessage(tab.id, { type: 'GET_VIEWER_COUNT' }).catch(err => {
+              console.warn(`[Whatnot Pulse] Could not send GET_VIEWER_COUNT to stream ${streamId} tab ${tab.id}:`, err);
             });
           } else {
             // Stream is no longer live (tab open but stream ended)
-            console.log('[Whatnot Pulse] Heartbeat: Stream no longer live, marking as ended');
+            console.log('[Whatnot Pulse] Heartbeat: Stream', streamId, 'no longer live, marking as ended');
             const updateData = {
-              streamer_username: currentStream.streamer_username,
+              streamer_username: streamState.streamer_username,
+              stream_id: streamId,
               is_live: false
             };
-            if (currentStream.stream_start_time) {
-              updateData.stream_start_time = currentStream.stream_start_time;
+            if (streamState.stream_start_time) {
+              updateData.stream_start_time = streamState.stream_start_time;
             }
             await updateLiveStatus(updateData);
             
-            stopViewerCountUpdates();
-            
-            // Clear current stream properties
-            currentStream.streamer_username = null;
-            currentStream.title = null;
-            currentStream.stream_url = null;
-            currentStream.lastViewerCount = null;
-            currentStream.lastPendingItems = null;
-            currentStream.stream_start_time = null;
-            
-            await chrome.storage.local.remove([
-              'current_streamer_username',
-              'current_stream_title',
-              'current_stream_url'
-            ]);
+            stopViewerCountUpdates(streamId);
+            resetStreamSession(streamId);
           }
-        } else {
-          // If no live tabs, assume stream ended
-          if (currentStream) {
-            console.log('[Whatnot Pulse] Heartbeat: No live tabs, marking stream as ended');
-            const updateData = {
-              streamer_username: currentStream.streamer_username,
-              is_live: false
-            };
-            if (currentStream.stream_start_time) {
-              updateData.stream_start_time = currentStream.stream_start_time;
-            }
-            await updateLiveStatus(updateData);
-            
-            stopViewerCountUpdates();
-            
-            // Clear current stream properties
-            currentStream.streamer_username = null;
-            currentStream.title = null;
-            currentStream.stream_url = null;
-            currentStream.lastViewerCount = null;
-            currentStream.lastPendingItems = null;
-            currentStream.stream_start_time = null;
-            
-            await chrome.storage.local.remove([
-              'current_streamer_username',
-              'current_stream_title',
-              'current_stream_url'
-            ]);
-          }
+        } catch (tabError) {
+          // Error processing this tab - continue with next tab
+          console.error(`[Whatnot Pulse] Error processing tab ${tab.id} in heartbeat:`, tabError);
+          continue;
         }
-      } catch (error) {
-        console.error('[Whatnot Pulse] Error in heartbeat:', error);
       }
-    } else if (connectionStatus.connected && organizationId) {
-      // Even if no stream, send a basic heartbeat to show extension is active
-      try {
-        // No-op: API doesn't support idle status updates without streamer_username
-        // Heartbeat is now handled via updateLiveStatus when is_live is true/false
-      } catch (error) {
-        console.warn('[Whatnot Pulse] Error sending idle heartbeat:', error);
-      }
+    } catch (error) {
+      console.error('[Whatnot Pulse] Error in heartbeat:', error);
     }
   }
 });
