@@ -3399,10 +3399,20 @@
         }
       }
       
-      // If still no price but it's payment pending, we can't process it
+      // If still no price but it's payment pending, create placeholder sale object
+      // This allows tracking of pending transactions even if price extraction fails
       if (soldPrice === null && isPaymentPending) {
-        console.warn('[Whatnot Pulse] Payment Pending item but no price found, skipping:', elementText.substring(0, 100));
-        return null;
+        console.warn('[Whatnot Pulse] Payment Pending item but no price found, creating placeholder sale:', elementText.substring(0, 100));
+        // Attempt to extract price from "last bid" text or similar patterns
+        const lastBidMatch = elementText.match(/last\s*bid[:\s]*\$?([\d,]+\.?\d*)/i);
+        if (lastBidMatch && lastBidMatch[1]) {
+          soldPrice = parseFloat(lastBidMatch[1].replace(/,/g, ''));
+          console.log('[Whatnot Pulse] Extracted price from last bid:', soldPrice);
+        } else {
+          // Set to 0 as placeholder - will be updated when payment clears
+          soldPrice = 0;
+        }
+        // Continue processing - we'll create a placeholder sale object below
       }
 
       // STEP 4.5: Additional giveaway check AFTER price extraction but BEFORE buyer extraction
@@ -3560,14 +3570,14 @@
         payment_status = "Completed";
       }
       
-      // VALIDATION: Payment pending items should NOT be sent as completed sales
-      // They should be tracked separately and only sent once payment clears
-      // Skip creating sale object if this is a payment pending item in batch extraction
+      // Payment pending items should be tracked (not skipped)
+      // The backend will handle them based on payment_status flag
       if (isPaymentPending && payment_status === 'Payment Pending') {
-        console.log('[Whatnot Pulse] Skipping payment pending item - will not create sale object:', itemName);
-        // Return null to skip this item in batch extraction
-        // In live monitoring, we track it but don't send as completed
-        return null;
+        console.log('[Whatnot Pulse] Creating placeholder sale object for payment pending item:', itemName || 'Unknown Item');
+        // Ensure sold_price is set (already handled above - either extracted or set to 0)
+        if (soldPrice === null) {
+          soldPrice = 0;
+        }
       }
       
       // Create sale object - matching Lovable API format
@@ -3694,10 +3704,11 @@
         if (saleContainer) {
           const saleData = extractSaleData(saleContainer);
           if (saleData) {
-            // Skip if marked as payment pending (don't mark as confirmed sale yet)
+            // Payment pending items are now tracked (not skipped)
+            // They will be sent with payment_status: 'Payment Pending' flag
+            // The backend can handle them appropriately (e.g., show in pending list, not count in confirmed revenue)
             if (saleData.is_pending && saleData.payment_status === 'Payment Pending') {
-              console.log('[Whatnot Pulse] Skipping payment pending item (not confirmed):', saleData.item_name);
-              continue;
+              console.log('[Whatnot Pulse] Including payment pending item (will be tracked):', saleData.item_name);
             }
             
             // Deduplication: Use unique signature (Price + Timestamp + Item Name)

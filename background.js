@@ -721,6 +721,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         fetch('http://127.0.0.1:7243/ingest/0b10f26a-c3be-4a7b-8048-763c7bd44ca8',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'background.js:578',message:'STREAM_DETECTED message received',data:{username:message.data?.username,viewerCount:message.data?.viewerCount,title:message.data?.title,streamUrl:message.data?.url},timestamp:Date.now(),sessionId:'debug-session',runId:'run7',hypothesisId:'H5'})}).catch(()=>{});
         // #endregion
         
+        // Clean Slate Architecture: Reset session immediately before processing new stream data
+        // This ensures no "Ghost State" persists from previous streams
+        resetStreamSession();
+        
         // Stream detected on live page
         const streamData = message.data;
         
@@ -739,22 +743,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             updateInterval: null,
             stream_start_time: null
           };
-        }
-        
-        // Check if this is a different stream (clean slate architecture)
-        // Force reset on every navigation to ensure clean state
-        const isDifferentStream = currentStream.stream_url && 
-                                   currentStream.stream_url !== streamData.url;
-        const isDifferentStreamer = currentStream.streamer_username && 
-                                     currentStream.streamer_username !== streamData.username;
-        const isDifferentStreamId = currentStream.stream_id && 
-                                     streamId && 
-                                     currentStream.stream_id !== streamId;
-        
-        // If different stream or streamer, reset session first (force reset)
-        if (isDifferentStream || isDifferentStreamer || isDifferentStreamId) {
-          console.log('[Whatnot Pulse] Different stream detected, resetting session before setting new stream');
-          resetStreamSession();
         }
         
         currentStream.streamer_username = streamData.username;
@@ -778,22 +766,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           
           // Validate: must be within time window
           if (hoursSinceStart >= 0 && hoursSinceStart <= maxHoursAgo) {
-            // Only set if currently null (new stream) or if different (stream changed)
-            if (!currentStream.stream_start_time || isDifferentStream || isDifferentStreamer || isDifferentStreamId) {
-              currentStream.stream_start_time = streamData.stream_start_time;
-              console.log('[Whatnot Pulse] Set stream_start_time:', streamData.stream_start_time, `(${hoursSinceStart.toFixed(2)}h ago, historical: ${isHistoricalPull})`);
-            } else {
-              console.log('[Whatnot Pulse] Keeping existing stream_start_time (already set for this stream)');
-            }
+            // Since we reset at the beginning, always set if valid
+            currentStream.stream_start_time = streamData.stream_start_time;
+            console.log('[Whatnot Pulse] Set stream_start_time:', streamData.stream_start_time, `(${hoursSinceStart.toFixed(2)}h ago, historical: ${isHistoricalPull})`);
           } else {
             console.warn('[Whatnot Pulse] Rejected stream_start_time - outside validation window:', hoursSinceStart.toFixed(2), 'hours (max:', maxHoursAgo, 'h)');
             currentStream.stream_start_time = null;
           }
         } else {
-          // If no start time provided and we don't have one, set to null
-          if (!currentStream.stream_start_time || isDifferentStream || isDifferentStreamer || isDifferentStreamId) {
-            currentStream.stream_start_time = null;
-          }
+          // If no start time provided, keep as null (already reset)
+          currentStream.stream_start_time = null;
         }
 
         console.log('[Whatnot Pulse] Updated currentStream:', currentStream);
@@ -845,6 +827,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Start periodic viewer count updates and heartbeat
         startViewerCountUpdates();
         console.log('[Whatnot Pulse] Started viewer count updates and heartbeat');
+        
+        // Automatically trigger full history extraction 5 seconds after stream detection
+        // This ensures we capture all sales even if joining mid-stream
+        setTimeout(async () => {
+          try {
+            // Find the active live stream tab
+            const tabs = await chrome.tabs.query({ url: ['*://*.whatnot.com/live/*', '*://www.whatnot.com/live/*'] });
+            const activeTab = tabs.find(t => t.active && t.url && t.url.includes('/live/')) || 
+                             tabs.find(t => t.url && t.url.includes('/live/'));
+            
+            if (activeTab && activeTab.id) {
+              console.log('[Whatnot Pulse] Automatically triggering full history extraction for tab:', activeTab.id);
+              try {
+                // Try to send message to content script (if already loaded)
+                await chrome.tabs.sendMessage(activeTab.id, { type: 'EXTRACT_FULL_HISTORY' });
+                console.log('[Whatnot Pulse] Sent EXTRACT_FULL_HISTORY message to tab', activeTab.id);
+              } catch (msgError) {
+                // Content script not loaded yet, inject it
+                console.log('[Whatnot Pulse] Content script not loaded, injecting for full history extraction...');
+                try {
+                  await chrome.scripting.executeScript({
+                    target: { tabId: activeTab.id },
+                    files: ['content.js']
+                  });
+                  // Wait for script to initialize
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  // Now send message
+                  await chrome.tabs.sendMessage(activeTab.id, { type: 'EXTRACT_FULL_HISTORY' });
+                  console.log('[Whatnot Pulse] Sent EXTRACT_FULL_HISTORY message after injection');
+                } catch (injectError) {
+                  console.warn('[Whatnot Pulse] Error injecting script for automatic full history extraction:', injectError);
+                }
+              }
+            } else {
+              console.warn('[Whatnot Pulse] No active live stream tab found for automatic full history extraction');
+            }
+          } catch (error) {
+            console.error('[Whatnot Pulse] Error triggering automatic full history extraction:', error);
+          }
+        }, 5000); // 5 second delay
         
         sendResponse({ success: true });
       }
@@ -1294,28 +1316,49 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 
 // Initialize on service worker startup
+// Use non-async listeners to prevent Status Code 15 errors
 chrome.runtime.onStartup.addListener(() => {
-  loadConfig();
+  // Use setTimeout to defer async operations, preventing service worker crash
+  setTimeout(() => {
+    loadConfig().catch(err => {
+      console.warn('[Whatnot Pulse] Error loading config on startup:', err);
+    }).then(() => {
+      // Load current stream state on startup
+      chrome.storage.local.get(['current_streamer_username', 'current_stream_title', 'current_stream_url']).then(result => {
+        if (result.current_streamer_username) {
+          currentStream.streamer_username = result.current_streamer_username;
+          currentStream.title = result.current_stream_title;
+          currentStream.stream_url = result.current_stream_url;
+          // Note: We don't automatically restart viewer count updates on service worker restart
+          // They will restart when content script sends STREAM_DETECTED message
+        }
+      }).catch(err => {
+        console.warn('[Whatnot Pulse] Error loading stream state on startup:', err);
+      });
+    });
+  }, 0);
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  loadConfig();
-});
-
-// Load config immediately
-loadConfig();
-
-// Load current stream state on startup
-loadConfig().then(() => {
-  chrome.storage.local.get(['current_streamer_username', 'current_stream_title', 'current_stream_url']).then(result => {
-    if (result.current_streamer_username) {
-      currentStream.streamer_username = result.current_streamer_username;
-      currentStream.title = result.current_stream_title;
-      currentStream.stream_url = result.current_stream_url;
-      // Note: We don't automatically restart viewer count updates on service worker restart
-      // They will restart when content script sends STREAM_DETECTED message
-    }
-  });
+  // Use setTimeout to defer async operations, preventing service worker crash
+  setTimeout(() => {
+    loadConfig().catch(err => {
+      console.warn('[Whatnot Pulse] Error loading config on install:', err);
+    }).then(() => {
+      // Load current stream state on startup
+      chrome.storage.local.get(['current_streamer_username', 'current_stream_title', 'current_stream_url']).then(result => {
+        if (result.current_streamer_username) {
+          currentStream.streamer_username = result.current_streamer_username;
+          currentStream.title = result.current_stream_title;
+          currentStream.stream_url = result.current_stream_url;
+          // Note: We don't automatically restart viewer count updates on service worker restart
+          // They will restart when content script sends STREAM_DETECTED message
+        }
+      }).catch(err => {
+        console.warn('[Whatnot Pulse] Error loading stream state on install:', err);
+      });
+    });
+  }, 0);
 });
 
 /**
@@ -1537,6 +1580,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
         console.log('[Whatnot Pulse] URL changed, resetting session immediately (Ghost State prevention)');
         console.log('[Whatnot Pulse] Previous:', currentStream.stream_url, 'New:', newUrl);
         resetStreamSession();
+      }
     }
     
     // If navigating away from live stream, reset immediately
