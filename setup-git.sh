@@ -57,9 +57,25 @@ git branch -M main
 # Push to GitHub
 echo "⬆️  Pushing to GitHub..."
 echo ""
-echo "⚠️  You may be prompted for GitHub credentials."
-echo "   If you have 2FA enabled, use a Personal Access Token as your password."
+echo "🔐 GitHub Authentication Required"
 echo ""
+echo "GitHub no longer accepts passwords for git operations."
+echo "You need to use a Personal Access Token (PAT)."
+echo ""
+echo "📋 Steps to create a PAT:"
+echo "   1. Go to: https://github.com/settings/tokens"
+echo "   2. Click 'Generate new token' → 'Generate new token (classic)'"
+echo "   3. Give it a name (e.g., 'Whatnot Extension')"
+echo "   4. Select scope: check 'repo' (this gives full repository access)"
+echo "   5. Click 'Generate token'"
+echo "   6. COPY THE TOKEN (you won't see it again!)"
+echo ""
+echo "💡 When prompted for credentials:"
+echo "   - Username: iamjoshmoulton-rt"
+echo "   - Password: [paste your Personal Access Token here]"
+echo ""
+echo "Press Enter to continue..."
+read
 
 git push -u origin main
 
