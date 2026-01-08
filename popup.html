@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Whatnot Pulse</title>
+  <link rel="stylesheet" href="styles/popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Whatnot Pulse</h1>
+      <div class="status-indicator" id="statusIndicator">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">Checking...</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="config-section">
+        <h2>Configuration</h2>
+        
+        <div class="form-group">
+          <label for="supabaseUrl">Supabase URL</label>
+          <input 
+            type="text" 
+            id="supabaseUrl" 
+            placeholder="https://your-project.supabase.co"
+            class="input-field"
+          />
+          <small class="help-text">Your Supabase project URL</small>
+        </div>
+
+        <div class="form-group">
+          <label for="apiKey">API Key</label>
+          <input 
+            type="password" 
+            id="apiKey" 
+            placeholder="Enter your API key"
+            class="input-field"
+          />
+          <small class="help-text">Your SaaS API key for authentication</small>
+        </div>
+
+        <button id="saveBtn" class="btn btn-primary">Save & Connect</button>
+        <button id="validateBtn" class="btn btn-secondary">Test Connection</button>
+      </section>
+
+      <section class="status-section" id="statusSection" style="display: none;">
+        <h2>Status</h2>
+        <div class="status-grid">
+          <div class="status-item">
+            <span class="status-label">Connection:</span>
+            <span class="status-value" id="connectionStatus">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Organization ID:</span>
+            <span class="status-value" id="organizationId">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Current Streamer:</span>
+            <span class="status-value" id="currentStreamer">-</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Queue Length:</span>
+            <span class="status-value" id="queueLength">0</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Last Sync:</span>
+            <span class="status-value" id="lastSync">-</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="info-section">
+        <h2>Information</h2>
+        <p class="info-text">
+          Visit any Whatnot live stream page to start monitoring sales automatically.
+          The extension will detect streamers and capture sales data in real-time.
+        </p>
+      </section>
+
+      <section class="debug-section" id="debugSection" style="display: none;">
+        <h2>Debug Information</h2>
+        <button id="toggleDebug" class="btn btn-secondary">Show Debug</button>
+        <div id="debugContent" style="display: none;">
+          <div class="debug-item">
+            <strong>Current Page:</strong>
+            <span id="debugCurrentPage">-</span>
+          </div>
+          <div class="debug-item">
+            <strong>Is Live Stream:</strong>
+            <span id="debugIsLive">-</span>
+          </div>
+          <div class="debug-item">
+            <strong>Streamer Username:</strong>
+            <span id="debugStreamer">-</span>
+          </div>
+          <div class="debug-item">
+            <strong>Last API Call:</strong>
+            <span id="debugLastApiCall">-</span>
+          </div>
+          <div class="debug-item">
+            <strong>Last Error:</strong>
+            <span id="debugLastError">-</span>
+          </div>
+          <button id="refreshDebug" class="btn btn-secondary">Refresh Debug Info</button>
+          <button id="injectConsoleTest" class="btn btn-secondary">Run Console Test</button>
+          <button id="getDomStructure" class="btn btn-secondary">Get DOM Structure</button>
+        </div>
+      </section>
+
+      <div class="error-message" id="errorMessage" style="display: none;"></div>
+      <div class="success-message" id="successMessage" style="display: none;"></div>
+    </main>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
